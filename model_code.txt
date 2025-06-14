@@ -1,0 +1,153 @@
+import torch
+import torchvision
+import torchvision.transforms as transforms
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import os
+from PIL import Image
+from tqdm import tqdm
+from collections import Counter
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
+model = mobilenet_v3_small(weights=weights)
+model.classifier = nn.Sequential(
+    nn.Linear(576, 1024),
+    nn.Hardswish(),
+    nn.Dropout(0.3),
+    nn.Linear(1024, 2)
+)
+model.to(device)
+
+
+class ImageDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.image_files = []
+        self.labels = []
+
+        for class_name in os.listdir(self.root_dir):
+            class_path = os.path.join(self.root_dir, class_name)
+            if not os.path.isdir(class_path):
+                continue
+            label = 0 if class_name == "NORMAL" else 1
+            for file in os.listdir(class_path):
+                if file.endswith((".jpg", ".jpeg", ".png")):
+                    self.image_files.append(os.path.join(class_path, file))
+                    self.labels.append(label)
+
+    def __len__(self):
+        return len(self.image_files)
+    
+    def __getitem__(self, index):
+        img_path = self.image_files[index]
+        label = self.labels[index]
+        image = Image.open(img_path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
+train_transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.RandomApply([transforms.ColorJitter(brightness=0.2, contrast=0.2)], p=0.9),
+    transforms.RandomRotation(5),
+    transforms.RandomAutocontrast(p=0.5),
+    transforms.RandomHorizontalFlip(p=0.3),
+    transforms.ToTensor(),
+])
+
+val_transform  = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),
+])
+
+full_dataset = ImageDataset(root_dir="chest_xray/train", transform=None)
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
+train_indices, val_indices = random_split(range(len(full_dataset)), [train_size, val_size])
+
+train_dataset = torch.utils.data.Subset(ImageDataset(root_dir="chest_xray/train", transform=train_transform), train_indices)
+val_dataset = torch.utils.data.Subset(ImageDataset(root_dir="chest_xray/train", transform=val_transform), val_indices)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
+
+
+label_counts = Counter(full_dataset.labels)
+total = sum(label_counts.values())
+class_weights = [total / label_counts[i] for i in range(2)]
+
+loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(class_weights).float().to(device))
+
+for name, param in model.features.named_parameters():
+    if "0" in name or "1" in name: 
+        param.requires_grad = False
+
+trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+optimizer = torch.optim.Adam(trainable_params, lr=0.001)
+scheduler =ReduceLROnPlateau(optimizer, mode="max", patience=2, factor=0.5)
+
+print(f"Кількість зображень у train: {len(train_dataset)}")
+
+
+
+model.train()
+best_val_acc = 0
+num_epochs = 40
+
+
+for epochs in range(num_epochs):
+    print(f"\n Епоха {epochs+1}/{num_epochs}")
+
+    train_loss, correct, total = 0, 0, 0
+
+    for images, labels in tqdm(train_loader):
+        images, labels = images.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = loss_fn(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+    train_acc = correct / total
+    
+
+    model.eval()
+
+    vall_loss, correct, total = 0, 0, 0, 
+    
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+
+            loss = loss_fn(outputs, labels)
+
+            vall_loss += loss.item()
+
+            _, predicted = outputs.max(1)
+
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    vall_acc = correct / total
+    print(f"ВТРАТИ ПІД ЧАС ВАЛІДАЦІЇ:{vall_loss}, ТОЧНІСТЬ:{vall_acc}")
+
+    scheduler.step(vall_acc)
+
+    if vall_acc > best_val_acc:
+        best_val_acc = vall_acc
+        torch.save(model.state_dict(), "BEST_MDL.pth3")
+        print("нова найкраща модель збережена")
